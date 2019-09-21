@@ -1,29 +1,41 @@
 # MIT License
 # Copyright (c) 2018 Andrei Regiani
 
+# 导入库
 import os, osproc, rdstdin, strformat, strutils, terminal, times, strformat
 
+
+# 定义类型
 type App = ref object
     nim: string
     srcFile: string
     showHeader: bool
+    compiler: string
 
+# 实例化
 var app: App
 
+# 定义常量
 const
+    # 版本号
     INimVersion = "0.4.1"
-    indentSpaces = "    "
-    indentTriggers = [",", "=", ":", "var", "let", "const", "type", "import",
-                      "object", "enum"] # endsWith
+    # 空格数
+    indentSpaces = "  "
+    indentTriggers = [",", "=", "var", "let", "const", "type", "import",
+                      "object", "enum", ":"] # endsWith
+    # 预导库
     embeddedCode = staticRead("inimpkg/embedded.nim") # preloaded code into user's session
 
 let
+    # 时区
     uniquePrefix = epochTime().int
+    # osproc
     bufferSource = getTempDir() & "inim_" & $uniquePrefix & ".nim"
 
 proc compileCode():auto =
     # PENDING https://github.com/nim-lang/Nim/issues/8312, remove redundant `--hint[source]=off`
-    let compileCmd = fmt"{app.nim} compile --run --verbosity=0 --hints=off --hint[source]=off --path=./ {bufferSource}"
+    let compileCmd = fmt"{app.nim} -d:release --cc:{app.compiler} compile --run --verbosity=0 --hints=off --hint[source]=off --path=./ {bufferSource}"
+    # let compileCmd = fmt"{app.nim} -d:release  cpp --run --verbosity=0 --hints=off --hint[source]=off --path=./ {bufferSource}"
     result = execCmdEx(compileCmd)
 
 var
@@ -34,6 +46,8 @@ var
     indentLevel = 0 # Current
     previouslyIndented = false # Helper for showError(), indentLevel resets before showError()
     buffer: File
+
+    colonFlag = false
 
 proc getNimVersion*(): string =
     let (output, status) = execCmdEx(fmt"{app.nim} --version")
@@ -65,7 +79,7 @@ proc welcomeScreen() =
 proc cleanExit(exitCode = 0) =
     buffer.close()
     removeFile(bufferSource) # Temp .nim
-    removeFile(bufferSource[0..^5]) # Temp binary, same filename just without ".nim"
+    removeFile(bufferSource.replace(".nim", ".exe")) # Temp binary, same filename just without ".nim"
     removeDir(getTempDir() & "nimcache")
     quit(exitCode)
 
@@ -145,6 +159,7 @@ proc showError(output: string) =
         c = previouslyIndented == false
         d = message.endsWith("discarded")
 
+
     # Discarded shortcut, print values: nim> myvar
     if a and b and c and d:
         # Following lines grabs the type from the discarded expression:
@@ -157,7 +172,6 @@ proc showError(output: string) =
         message[message.rfind("'")] = ';' # last single-quote
         let message_seq = message.split(";") # expression;type, e.g 'a';char
         let typeExpression = message_seq[1] # type, e.g. char
-
         var shortcut:string
         when defined(Windows):
             shortcut = fmt"""
@@ -166,6 +180,7 @@ proc showError(output: string) =
             stdout.write "{typeExpression}"
             echo ""
             """.replace("            ", "")
+
         else: # Posix: colorize type to yellow
             shortcut = fmt"""
             stdout.write $({currentExpression})
@@ -210,6 +225,11 @@ proc init(preload = "") =
 
     # Check preloaded file compiles succesfully
     let (output, status) = compileCode()
+    # #############################
+    # stdout.write output
+    # stdout.resetAttributes()
+    # stdout.flushFile()
+    # #############################
     if status == 0:
         compilationSuccess(preload, output)
 
@@ -222,9 +242,12 @@ proc init(preload = "") =
         cleanExit(1)
 
 proc getPromptSymbol(): string =
-    if indentLevel == 0:
+    if indentLevel == 0 and not colonFlag:
         result = "nim> "
         previouslyIndented = false
+    elif indentLevel == 0 and colonFlag:
+        colonFlag = false
+        result =  ".... "
     else:
         result =  ".... "
     # Auto-indent (multi-level)
@@ -236,7 +259,9 @@ proc hasIndentTrigger*(line: string): bool =
             if line.strip().endsWith(trigger):
                 result = true
 
+
 proc runForever() =
+
     while true:
         # Read line
         try:
@@ -255,17 +280,27 @@ proc runForever() =
         if currentExpression == "":
             if indentLevel > 0:
                 indentLevel -= 1
-            elif indentLevel == 0:
+            elif indentLevel == 0 and not colonFlag:
+                discard
+            elif indentLevel == 0 and colonFlag:
                 continue
+            
 
         # Write your line to buffer(temp) source code
         buffer.writeLine(indentSpaces.repeat(indentLevel) & currentExpression)
         buffer.flushFile()
+        # echo indentLevel, colonFlag
+        if indentLevel == 0 and colonFlag:
+            continue
 
         # Check for indent and trigger it
         if currentExpression.hasIndentTrigger():
             indentLevel += 1
             previouslyIndented = true
+
+        if currentExpression.strip.endsWith(":"):
+            colonFlag = true
+
 
         # Don't run yet if still on indent
         if indentLevel != 0:
@@ -277,11 +312,30 @@ proc runForever() =
             continue
 
         # Compile buffer
-        let (output, status) = compileCode()
-
+        var 
+            (output, status) = compileCode()
+            pos = output.find(";") 
+            message = "" 
+        try:
+            message = output[0 .. pos-1].strip
+        except RangeError:
+            discard
         # Succesful compilation, expression is valid
         if status == 0:
             compilationSuccess(currentExpression, output)
+
+        elif message.endsWith("discarded"):
+            let expression_size = currentExpression.len + 1
+            currentExpression = "echo " & currentExpression
+            ####
+            let pos_size = buffer.getFilePos()
+            buffer.setFilePos(pos_size - expression_size)
+            buffer.writeLine(indentSpaces.repeat(indentLevel) & currentExpression)
+            buffer.flushFile()
+            ####
+            (output, status) = compileCode()
+            if status == 0:
+                compilationSuccess(currentExpression, output)
 
         # Compilation error
         else:
@@ -292,6 +346,7 @@ proc runForever() =
 
         # Clean up
         tempIndentCode = ""
+  
 
 proc initApp*() =
     ## Initialize the ``app` variable.
@@ -299,14 +354,16 @@ proc initApp*() =
     app.nim = "nim"
     app.srcFile = ""
     app.showHeader = true
+    app.compiler = "gcc"
 
-proc main(nim = "nim", srcFile = "", showHeader = true) =
+proc main(nim="nim", srcFile="", showHeader=true, compiler="tcc") =
     ## inim interpreter
 
     initApp()
     app.nim=nim
     app.srcFile=srcFile
     app.showHeader=showHeader
+    app.compiler = compiler
 
     if app.showHeader: welcomeScreen()
 
@@ -319,6 +376,7 @@ proc main(nim = "nim", srcFile = "", showHeader = true) =
         init() # Clean init
 
     runForever()
+    cleanExit()
 
 when isMainModule:
     import cligen
@@ -327,3 +385,4 @@ when isMainModule:
             "srcFile": "nim script to preload/run",
             "showHeader": "show program info startup",
         })
+
